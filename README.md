@@ -18,3 +18,6 @@ curl https://platform.claude.com/docs/ja/release-notes/system-prompts.md > data/
 ```
 python scripts/find_style_rules.py data/system-prompts_en.md -o style_rules_report.md
 ```
+
+"the human" → "the person" / "the user" の呼称推移を集計・グラフ化: 
+[pronoun_shift.ipynb](pronoun_shift.ipynb)
