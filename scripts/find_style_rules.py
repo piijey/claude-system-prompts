@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-Scan claude_system_prompts_full.md (produced by extract_nextjs_rsc.py) for
-specific "avoid this word/phrase/style" instructions, grouped by category,
-with the exact matching sentence and which model+date it came from.
+Scan a Claude system-prompts changelog doc — the .md Mintlify offers as a
+direct download of https://platform.claude.com/docs/en/release-notes/system-prompts
+— for specific "avoid this word/phrase/style" instructions, grouped by
+category, with the exact matching sentence and which model+date it came
+from.
 
 This exists so that "eyeballing the doc and spotting something interesting"
 turns into an editable, rerunnable search instead of a one-off script each
@@ -10,8 +12,8 @@ time. To track a newly-noticed rule: add a (label, regex) pair to CATEGORIES
 below and rerun.
 
 Usage:
-    python3 find_style_rules.py claude_system_prompts_full.md
-    python3 find_style_rules.py claude_system_prompts_full.md -o report.md
+    python3 find_style_rules.py data/system-prompts_en.md
+    python3 find_style_rules.py data/system-prompts_en.md -o report.md
 """
 import argparse
 import re
@@ -71,18 +73,23 @@ def _clean(s):
     # in a few of the oldest Claude 3-era prompt entries) both collapse to a
     # single space, then runs of whitespace collapse to one.
     s = s.replace("\n", " ").replace("\\n", " ")
+    # The Mintlify markdown download wraps the parts of an entry that changed
+    # since the model's previous dated entry in "**bold**", and a run of
+    # lines within one entry can each end in a markdown hard-break "\". Both
+    # are formatting, not content — left in, they make an otherwise-identical
+    # sentence look like a distinct new wording and get double-counted.
+    s = s.replace("**", "").replace("\\", "")
     return re.sub(r'\s+', ' ', s).strip()
 
 
 def load_units(path):
-    """Returns (sentences, blocks): both are lists of (model, date, text).
+    r"""Returns (sentences, blocks): both are lists of (model, date, text).
     `sentences` is one entry per sentence; `blocks` is one entry per source
-    paragraph — bounded by a blank line (extract_nextjs_rsc.py now emits one
-    per original <p>) OR by a <tag>/</tag> marker, whichever is tighter.
-    Both boundaries are needed: most paragraphs are blank-line separated,
-    but a few older entries pack a section transition like
-    "...blow.\n</lists_and_bullets>\n<user_wellbeing>\nClaude uses..." into
-    a single <p> with only single newlines, which a blank-line split alone
+    paragraph — bounded by a blank line OR by a <tag>/</tag> marker,
+    whichever is tighter. Both boundaries are needed: most paragraphs are
+    blank-line separated, but a few older entries pack a section transition
+    like "...blow. \<\/lists\_and\_bullets> \<user\_wellbeing> Claude uses..."
+    into running prose with no blank line, which a blank-line split alone
     would not catch."""
     with open(path, encoding="utf-8") as f:
         text = f.read()
@@ -97,7 +104,12 @@ def load_units(path):
     # a single giant block.
     text = text.replace("\\n", "\n")
     model_headers = [(m.start(), m.group(1).strip()) for m in re.finditer(r'^## (.+)$', text, flags=re.M)]
-    date_headers = [(m.start(), m.group(1).strip()) for m in re.finditer(r'^### (.+)$', text, flags=re.M)]
+    # The Mintlify markdown download wraps each dated entry in an
+    # <Accordion title="<date>"> component instead of using a heading.
+    date_headers = [
+        (m.start(), m.group(1).strip())
+        for m in re.finditer(r'<Accordion title="([^"]+)">', text)
+    ]
 
     def lookup(headers, offset):
         best = None
@@ -108,29 +120,57 @@ def load_units(path):
                 break
         return best
 
-    tag_pattern = r'(</?[a-zA-Z0-9_]+>)'
-    para_pattern = r'\n\s*\n+'
-    sentence_pattern = SENTENCE_PATTERN
-    sentences, blocks, offset = [], [], 0
-    for chunk in re.split(tag_pattern, text):
-        if re.fullmatch(tag_pattern, chunk):
-            continue
-        for para in re.split(para_pattern, chunk):
-            idx = text.find(para, offset)
-            if idx == -1:
-                idx = offset
+    def content_start(piece_start, piece):
+        # A block/sentence span from split_with_offsets includes its leading
+        # blank-line whitespace. A date header positioned inside that gap —
+        # e.g. "<Accordion title=\"...\">" sits a few indentation characters
+        # after the paragraph's true start — would otherwise be judged as
+        # "not yet reached" and the lookup would fall back to whatever
+        # (unrelated) header came before it. Skipping the leading whitespace
+        # puts the lookup position at or past the header itself.
+        return piece_start + (len(piece) - len(piece.lstrip()))
+
+    # Two kinds of tag get stripped here: the prompt's own section markers,
+    # which the Mintlify markdown download backslash-escapes to keep them
+    # from being read as HTML/JSX (e.g. "\<lists\_and\_bullets>"), and the
+    # page's bare <Accordion>/<AccordionGroup> wrapper tags (no backslash).
+    # Both need to go so they don't leak into a block/sentence as literal
+    # text — and stripping the Accordion wrapper is what lets content_start()
+    # below land exactly on the "<Accordion title=...>" tag that follows it,
+    # rather than the date lookup falling short and matching a stale header.
+    tag_rx = re.compile(r'\\?</?(?:\\?[a-zA-Z0-9_])+>')
+    para_rx = re.compile(r'\n\s*\n+')
+    sentence_rx = re.compile(SENTENCE_PATTERN)
+
+    def split_with_offsets(rx, s, base):
+        """Like rx.split(s), but yields (absolute_offset, piece) instead of
+        just piece — computed directly from match spans rather than by
+        re-locating the piece in the original text with str.find(). The
+        prompts repeat a lot of near-identical boilerplate across model
+        entries, and a shared running search cursor can drift onto the wrong
+        occurrence of a duplicated paragraph/sentence, which previously
+        misattributed some blocks to the wrong model/date (e.g. Claude
+        Opus 3's single July 12, 2024 entry was once matched against a date
+        header from an earlier, unrelated section)."""
+        pos = 0
+        for m in rx.finditer(s):
+            yield base + pos, s[pos:m.start()]
+            pos = m.end()
+        yield base + pos, s[pos:]
+
+    sentences, blocks = [], []
+    for chunk_start, chunk in split_with_offsets(tag_rx, text, 0):
+        for para_start, para in split_with_offsets(para_rx, chunk, chunk_start):
+            para_pos = content_start(para_start, para)
             block_text = _clean(para)
             if block_text:
-                blocks.append((lookup(model_headers, idx), lookup(date_headers, idx), block_text))
-            for sent in re.split(sentence_pattern, para):
-                sidx = text.find(sent, offset)
-                if sidx == -1:
-                    sidx = offset
-                offset = sidx + len(sent)
+                blocks.append((lookup(model_headers, para_pos), lookup(date_headers, para_pos), block_text))
+            for sent_start, sent in split_with_offsets(sentence_rx, para, para_start):
+                sent_start = content_start(sent_start, sent)
                 stripped = _clean(sent)
                 if not stripped:
                     continue
-                sentences.append((lookup(model_headers, sidx), lookup(date_headers, sidx), stripped))
+                sentences.append((lookup(model_headers, sent_start), lookup(date_headers, sent_start), stripped))
     return sentences, blocks
 
 
